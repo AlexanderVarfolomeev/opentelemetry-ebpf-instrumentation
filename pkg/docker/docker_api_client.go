@@ -141,10 +141,26 @@ func (s *ContainerStore) ContainerInfo(ctx context.Context, pid app.PID) (Contai
 		s.cacheMu.RUnlock()
 		return ci, true
 	}
-	retryAt := s.notContainerUntilByPID[pid]
+	retryAt, notContainer := s.notContainerUntilByPID[pid]
 	s.cacheMu.RUnlock()
-	if time.Now().Before(retryAt) {
-		return ContainerMeta{}, false
+	if notContainer {
+		if time.Now().Before(retryAt) {
+			return ContainerMeta{}, false
+		}
+
+		s.cacheMu.Lock()
+		if ci, ok := s.byPID[pid]; ok {
+			s.cacheMu.Unlock()
+			return ci, true
+		}
+		if retryAt, ok := s.notContainerUntilByPID[pid]; ok {
+			if time.Now().Before(retryAt) {
+				s.cacheMu.Unlock()
+				return ContainerMeta{}, false
+			}
+			delete(s.notContainerUntilByPID, pid)
+		}
+		s.cacheMu.Unlock()
 	}
 
 	osCntInfo, err := osInfoForPID(pid)

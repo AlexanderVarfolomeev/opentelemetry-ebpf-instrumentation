@@ -198,6 +198,38 @@ func TestContainerInfo(t *testing.T) {
 		})
 	})
 
+	t.Run("expired_container_not_found_entry_is_removed_when_retry_fails", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s := NewStore()
+			s.docker = eofMock()
+
+			lookupErr := container.ErrContainerNotFound
+			orig := osInfoForPID
+			osInfoForPID = func(_ app.PID) (container.Info, error) {
+				return container.Info{}, lookupErr
+			}
+			defer func() { osInfoForPID = orig }()
+
+			pid := app.PID(1)
+			_, ok := s.ContainerInfo(context.Background(), pid)
+			assert.False(t, ok)
+			s.cacheMu.RLock()
+			_, negativelyCached := s.notContainerUntilByPID[pid]
+			s.cacheMu.RUnlock()
+			require.True(t, negativelyCached)
+
+			time.Sleep(containerNotFoundRetryInterval)
+			lookupErr = errors.New("no cgroup")
+			_, ok = s.ContainerInfo(context.Background(), pid)
+			assert.False(t, ok)
+
+			s.cacheMu.RLock()
+			_, negativelyCached = s.notContainerUntilByPID[pid]
+			s.cacheMu.RUnlock()
+			assert.False(t, negativelyCached)
+		})
+	})
+
 	t.Run("invalidate_pid_clears_container_not_found_cache", func(t *testing.T) {
 		s := NewStore()
 		s.docker = &mockDockerClient{
