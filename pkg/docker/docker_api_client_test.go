@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync"
@@ -191,10 +192,56 @@ func TestContainerInfo(t *testing.T) {
 			got, retriedOK := s.ContainerInfo(context.Background(), pid)
 			require.True(t, retriedOK)
 			assert.Equal(t, ContainerID(fullID), got.FullID)
+			assert.Equal(t, 4, calls)
 			s.cacheMu.RLock()
 			_, negativelyCached := s.notContainerUntilByPID[pid]
 			s.cacheMu.RUnlock()
 			assert.False(t, negativelyCached)
+		})
+	})
+
+	t.Run("concurrent_container_not_found_lookups_share_cached_result", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s := NewStore()
+			s.docker = eofMock()
+
+			lookupStarted := make(chan struct{})
+			releaseLookup := make(chan struct{})
+			var calls atomic.Int32
+
+			orig := osInfoForPID
+			osInfoForPID = func(_ app.PID) (container.Info, error) {
+				if calls.Add(1) == 1 {
+					close(lookupStarted)
+					<-releaseLookup
+				}
+				return container.Info{}, container.ErrContainerNotFound
+			}
+			defer func() { osInfoForPID = orig }()
+
+			pid := app.PID(1)
+			firstResult := make(chan bool, 1)
+			go func() {
+				_, ok := s.ContainerInfo(context.Background(), pid)
+				firstResult <- ok
+			}()
+			<-lookupStarted
+
+			secondResult := make(chan bool, 1)
+			secondStarted := make(chan struct{})
+			go func() {
+				close(secondStarted)
+				_, ok := s.ContainerInfo(context.Background(), pid)
+				secondResult <- ok
+			}()
+			<-secondStarted
+			runtime.Gosched()
+			assert.Equal(t, int32(1), calls.Load())
+
+			close(releaseLookup)
+			assert.False(t, <-firstResult)
+			assert.False(t, <-secondResult)
+			assert.Equal(t, int32(2), calls.Load())
 		})
 	})
 

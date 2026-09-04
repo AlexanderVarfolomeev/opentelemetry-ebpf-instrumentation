@@ -79,6 +79,7 @@ type ContainerStore struct {
 	watcherStarted sync.Once
 	watcherRunning atomic.Bool
 
+	lookupMu               sync.Mutex
 	cacheMu                sync.RWMutex
 	byPID                  map[app.PID]ContainerMeta
 	byContainerID          map[ContainerID]containerEntry // metadata + PIDs keyed by full container ID
@@ -143,40 +144,46 @@ func (s *ContainerStore) ContainerInfo(ctx context.Context, pid app.PID) (Contai
 	}
 	retryAt, notContainer := s.notContainerUntilByPID[pid]
 	s.cacheMu.RUnlock()
-	if notContainer {
+	if notContainer && time.Now().Before(retryAt) {
+		return ContainerMeta{}, false
+	}
+
+	// Serialize uncached procfs lookups. Otherwise concurrent spans for the same
+	// PID can all scan procfs before the first negative result is cached. Cache
+	// hits do not take this lock.
+	// ponytail: use one bounded lock; shard it by PID if cold lookups become a measured bottleneck.
+	s.lookupMu.Lock()
+	s.cacheMu.Lock()
+	if ci, ok := s.byPID[pid]; ok {
+		s.cacheMu.Unlock()
+		s.lookupMu.Unlock()
+		return ci, true
+	}
+	if retryAt, ok := s.notContainerUntilByPID[pid]; ok {
 		if time.Now().Before(retryAt) {
+			s.cacheMu.Unlock()
+			s.lookupMu.Unlock()
 			return ContainerMeta{}, false
 		}
+		delete(s.notContainerUntilByPID, pid)
+	}
+	s.cacheMu.Unlock()
 
+	osCntInfo, err := osInfoForPID(pid)
+	if errors.Is(err, container.ErrContainerNotFound) {
 		s.cacheMu.Lock()
-		if ci, ok := s.byPID[pid]; ok {
-			s.cacheMu.Unlock()
-			return ci, true
-		}
-		if retryAt, ok := s.notContainerUntilByPID[pid]; ok {
-			if time.Now().Before(retryAt) {
-				s.cacheMu.Unlock()
-				return ContainerMeta{}, false
+		retryAt := s.notContainerUntilByPID[pid]
+		if _, ok := s.byPID[pid]; !ok && !time.Now().Before(retryAt) {
+			// InvalidatePID may have run while the first lookup was in flight.
+			_, currentErr := osInfoForPID(pid)
+			if errors.Is(currentErr, container.ErrContainerNotFound) {
+				s.notContainerUntilByPID[pid] = time.Now().Add(containerNotFoundRetryInterval)
 			}
-			delete(s.notContainerUntilByPID, pid)
 		}
 		s.cacheMu.Unlock()
 	}
-
-	osCntInfo, err := osInfoForPID(pid)
+	s.lookupMu.Unlock()
 	if err != nil {
-		if errors.Is(err, container.ErrContainerNotFound) {
-			s.cacheMu.Lock()
-			retryAt := s.notContainerUntilByPID[pid]
-			if _, ok := s.byPID[pid]; !ok && !time.Now().Before(retryAt) {
-				// InvalidatePID may have run while the first lookup was in flight.
-				_, currentErr := osInfoForPID(pid)
-				if errors.Is(currentErr, container.ErrContainerNotFound) {
-					s.notContainerUntilByPID[pid] = time.Now().Add(containerNotFoundRetryInterval)
-				}
-			}
-			s.cacheMu.Unlock()
-		}
 		s.log.Debug("failed to get OS container info for pid", "pid", pid, "error", err)
 		return ContainerMeta{}, false
 	}
