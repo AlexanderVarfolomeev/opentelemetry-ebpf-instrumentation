@@ -11,6 +11,7 @@
 #include <common/lw_thread.h>
 #include <common/python_task.h>
 #include <common/runtime.h>
+#include <common/squid.h>
 #include <common/trace_helpers.h>
 
 #include <pid/pid_helpers.h>
@@ -318,8 +319,12 @@ static __always_inline tp_info_pid_t *find_parent_trace(const pid_connection_inf
         return python_parent;
     }
 
-    tp_info_pid_t *nginx_parent = find_nginx_parent_trace(p_conn, orig_dport);
+    tp_info_pid_t *squid_parent = find_squid_parent_trace(p_conn);
+    if (squid_parent) {
+        return squid_parent;
+    }
 
+    tp_info_pid_t *nginx_parent = find_nginx_parent_trace(p_conn, orig_dport);
     if (nginx_parent) {
         return nginx_parent;
     }

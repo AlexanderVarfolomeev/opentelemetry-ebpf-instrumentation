@@ -458,6 +458,7 @@ func (p *Tracer) Tracepoints() map[string]ebpfcommon.ProbeDesc {
 
 func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 	m := map[string]map[string][]*ebpfcommon.ProbeDesc{
+		"squid": p.squidProbes(),
 		"libssl.so": {
 			"SSL_read": {{
 				Required: false,
