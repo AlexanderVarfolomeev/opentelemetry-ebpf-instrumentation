@@ -316,6 +316,100 @@ func TestInstrumentProbesSkipsMarkedOptionalProbe(t *testing.T) {
 	assert.False(t, attached["skipped_optional_symbol"])
 }
 
+type uprobeActivationTracer struct {
+	stubTracer
+	activate func(string, map[string][]*ebpfcommon.ProbeDesc) (io.Closer, error)
+	record   func(uint64, []io.Closer)
+}
+
+func (t *uprobeActivationTracer) ActivateUProbeGroup(path string, probes map[string][]*ebpfcommon.ProbeDesc) (io.Closer, error) {
+	return t.activate(path, probes)
+}
+
+func (t *uprobeActivationTracer) RecordInstrumentedLib(inode uint64, closers []io.Closer) {
+	if t.record != nil {
+		t.record(inode, closers)
+	}
+}
+
+func TestUProbeGroupsAcquireOneModuleReference(t *testing.T) {
+	var closed []string
+	libs := make(ebpfcommon.InstrumentedLibsT)
+	tracer := &uprobeActivationTracer{
+		stubTracer: stubTracer{uprobes: map[string]map[string][]*ebpfcommon.ProbeDesc{
+			"missing_group_a": {"missing_symbol_a": {{}}},
+			"missing_group_b": {"missing_symbol_b": {{}}},
+		}},
+		// Activation resources exercise group ownership without kernel probes.
+		activate: func(_ string, probes map[string][]*ebpfcommon.ProbeDesc) (io.Closer, error) {
+			for symbol := range probes {
+				return orderedCloser{name: symbol, closes: &closed}, nil
+			}
+			return nil, nil
+		},
+		record: func(inode uint64, closers []io.Closer) {
+			module := libs.AddRef(inode)
+			module.Closers = append(module.Closers, closers...)
+		},
+	}
+	i := &instrumenter{modules: make(map[uint64]struct{})}
+	pid := app.PID(os.Getpid())
+	require.NoError(t, i.uprobes(pid, tracer, []*procfs.ProcMap{{Pathname: "/synthetic-library.so"}}))
+	_, inode, err := resolveExePath(pid)
+	require.NoError(t, err)
+	module := libs.Find(inode)
+	require.NotNil(t, module)
+	require.Equal(t, uint64(1), module.References)
+	require.Len(t, module.Closers, 2)
+	require.Empty(t, closed)
+	_, err = libs.RemoveRef(inode)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"missing_symbol_a", "missing_symbol_b"}, closed)
+}
+
+func TestActivateUProbeGroupClosesGateBeforeLinks(t *testing.T) {
+	var closed []string
+	probes := probeDescMap{"squid": {{Required: true}}}
+	tracer := &uprobeActivationTracer{activate: func(path string, got map[string][]*ebpfcommon.ProbeDesc) (io.Closer, error) {
+		assert.Equal(t, "/proc/42/exe", path)
+		assert.Equal(t, map[string][]*ebpfcommon.ProbeDesc(probes), got)
+		return orderedCloser{name: "gate", closes: &closed}, nil
+	}}
+	links := []io.Closer{
+		orderedCloser{name: "constructor", closes: &closed},
+		orderedCloser{name: "destructor", closes: &closed},
+	}
+	closers, err := activateUProbeGroup(tracer, "/proc/42/exe", probes, links)
+	require.NoError(t, err)
+	require.Empty(t, closed)
+	closeAll(closers)
+	assert.Equal(t, []string{"gate", "constructor", "destructor"}, closed)
+}
+
+func TestActivateUProbeGroupFailureClosesOnlyItsLinks(t *testing.T) {
+	groupLink := &countingCloser{}
+	siblingLink := &countingCloser{}
+	partialActivation := &countingCloser{}
+	activationErr := errors.New("activation map is full")
+	tracer := &uprobeActivationTracer{activate: func(string, map[string][]*ebpfcommon.ProbeDesc) (io.Closer, error) {
+		return partialActivation, activationErr
+	}}
+	closers, err := activateUProbeGroup(tracer, "/proc/42/exe", nil, []io.Closer{groupLink})
+	require.ErrorIs(t, err, activationErr)
+	assert.Empty(t, closers)
+	assert.Equal(t, int32(1), partialActivation.closes.Load())
+	assert.Equal(t, int32(1), groupLink.closes.Load())
+	assert.Zero(t, siblingLink.closes.Load())
+}
+
+func TestActivateUProbeGroupWithoutActivatorKeepsLinks(t *testing.T) {
+	link := &countingCloser{}
+	closers, err := activateUProbeGroup(&stubTracer{}, "/proc/42/exe", nil, []io.Closer{link})
+	require.NoError(t, err)
+	assert.Equal(t, []io.Closer{link}, closers)
+	assert.Zero(t, link.closes.Load())
+}
+
 func TestNoGoProbeAttached(t *testing.T) {
 	assert.False(t, noGoProbeAttached(nil))
 	assert.False(t, noGoProbeAttached(map[string]bool{"a": false, "b": true}))

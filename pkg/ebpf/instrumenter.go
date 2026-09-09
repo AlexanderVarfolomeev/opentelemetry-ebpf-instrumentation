@@ -64,6 +64,10 @@ type goProbeGroupTracer interface {
 	GoProbeGroups() []ebpfcommon.GoProbeGroup
 }
 
+type uprobeGroupActivator interface {
+	ActivateUProbeGroup(string, map[string][]*ebpfcommon.ProbeDesc) (io.Closer, error)
+}
+
 // processScopedGoProbeTracer registers optional Go probes that are attached
 // for individual processes after their executable-scoped probe group succeeds.
 type processScopedGoProbeTracer interface {
@@ -271,6 +275,31 @@ func (i *instrumenter) instrumentProbesWithResults(
 	}
 
 	return closers, attachedSymbols, nil
+}
+
+func activateUProbeGroup(
+	p Tracer,
+	path string,
+	probes map[string][]*ebpfcommon.ProbeDesc,
+	closers []io.Closer,
+) ([]io.Closer, error) {
+	activator, ok := p.(uprobeGroupActivator)
+	if !ok {
+		return closers, nil
+	}
+	cleanup, err := activator.ActivateUProbeGroup(path, probes)
+	if err != nil {
+		if cleanup != nil {
+			_ = cleanup.Close()
+		}
+		closeAll(closers)
+		return nil, fmt.Errorf("activating uprobe group: %w", err)
+	}
+	if cleanup != nil {
+		// Disable the group before any of its lifecycle probes are detached.
+		closers = append([]io.Closer{cleanup}, closers...)
+	}
+	return closers, nil
 }
 
 type goProbeAttacher func(string, *ebpfcommon.ProbeDesc) ([]io.Closer, error)
@@ -658,6 +687,7 @@ func (i *instrumenter) uprobes(pid app.PID, p Tracer, maps []*procfs.ProcMap) er
 			continue
 		}
 
+		var moduleClosers []io.Closer
 		for j := range m.probes {
 			if err := gatherOffsets(m.instrPath, m.probes[j], log); err != nil {
 				log.Debug("error gathering offsets", "error", err)
@@ -669,11 +699,18 @@ func (i *instrumenter) uprobes(pid app.PID, p Tracer, maps []*procfs.ProcMap) er
 				log.Debug("error instrumenting probes", "error", err)
 				continue
 			}
+			closers, err = activateUProbeGroup(p, m.instrPath, m.probes[j], closers)
+			if err != nil {
+				log.Debug("error activating uprobe group", "error", err)
+				continue
+			}
 
+			moduleClosers = append(moduleClosers, closers...)
+		}
+		if len(moduleClosers) != 0 {
 			log.Debug("adding module for instrumenter and incrementing reference count", "path", m.instrPath, "ino", instrumentedIno)
-
-			// We bump the count of uses of the underlying shared library with a new executable
-			p.RecordInstrumentedLib(instrumentedIno, closers)
+			// Unlinking releases one reference per inode, not one per probe group.
+			p.RecordInstrumentedLib(instrumentedIno, moduleClosers)
 			i.addModule(instrumentedIno)
 		}
 	}
