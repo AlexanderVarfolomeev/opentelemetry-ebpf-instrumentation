@@ -1265,6 +1265,15 @@ static __always_inline bool apply_parent_tp(const tailcall_ctx *t_ctx, tp_info_t
 
 static __always_inline void
 assign_parent_tp(const tailcall_ctx *t_ctx, tp_info_t *tp, unsigned char *span_id) {
+    if (!t_ctx->has_parent_tp ||
+        bpf_memcmp(tp->trace_id, t_ctx->parent_tp.trace_id, TRACE_ID_SIZE_BYTES) != 0) {
+        // The propagated context is a parent, not this outgoing operation's identity.
+        bpf_memcpy(tp->parent_id, tp->span_id, SPAN_ID_SIZE_BYTES);
+        urand_bytes(tp->span_id, SPAN_ID_SIZE_BYTES);
+        encode_hex(span_id, tp->span_id, SPAN_ID_SIZE_BYTES);
+        return;
+    }
+
     if (apply_parent_tp(t_ctx, tp)) {
         bpf_dbg_printk("detected forwarded TP header, overriding span id");
         encode_hex(span_id, tp->span_id, SPAN_ID_SIZE_BYTES);
